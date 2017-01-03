@@ -39,7 +39,9 @@ func getClientsetOrDie(kubeconfig *string) *kubernetes.Clientset {
 func main() {
 	kubeconfig := flag.String("kubeconfig", "", "Path to a kube config. Only required if out-of-cluster.")
 	flag.Parse()
-	controller := newendpointLookupController(kubeconfig)
+	controller := newServiceLookupController(kubeconfig)
+	var stopCh <-chan struct{}
+	controller.Run(2, stopCh)
 }
 
 type serviceLookupController struct {
@@ -80,6 +82,10 @@ func (slm *serviceLookupController) podWorker() {
 			fmt.Printf("Pod has been deleted %v", key)
 			return false
 		}
+		if err != nil {
+			fmt.Printf("cannot get pod: %v", key)
+			return false
+		}
 
 		pod := obj.(*v1.Pod)
 		slm.addressToPod.Write(pod.Status.PodIP, pod)
@@ -93,13 +99,17 @@ func (slm *serviceLookupController) podWorker() {
 	}
 }
 
-func (slm *serviceLookupController) enqueueendpoint(obj interface{}) {
+func (slm *serviceLookupController) enqueueEndpoint(obj interface{}) {
 	key, err := controller.KeyFunc(obj)
 	if err != nil {
 		fmt.Printf("Couldn't get key for object %+v: %v", obj, err)
 		return
 	}
 	slm.endpointsQueue.Add(key)
+}
+
+func (slm *serviceLookupController) updateEndpoint(oldObj interface{}, newObj interface{}) {
+	slm.enqueueEndpoint(newObj)
 }
 
 func (slm *serviceLookupController) endpointWorker() {
@@ -113,6 +123,10 @@ func (slm *serviceLookupController) endpointWorker() {
 		obj, exists, err := slm.endpointsStore.GetByKey(key.(string))
 		if !exists {
 			fmt.Printf("endpoint has been deleted %v", key)
+			return false
+		}
+		if err != nil {
+			fmt.Printf("cannot get endpoint: %v", key)
 			return false
 		}
 
@@ -142,14 +156,14 @@ func (slm *serviceLookupController) endpointWorker() {
 	}
 }
 
-func newendpointLookupController(kubeconfig *string) *serviceLookupController {
+func newServiceLookupController(kubeconfig *string) *serviceLookupController {
 	slm := &serviceLookupController{
 		kubeClient:     getClientsetOrDie(kubeconfig),
 		podsQueue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "pods"),
 		endpointsQueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "endpoints"),
 	}
 
-	slm.podStore.Indexer, slm.podController = cache.NewInformer(
+	slm.podStore.Indexer, slm.podController = cache.NewIndexerInformer(
 		&cache.ListWatch{
 			ListFunc: func(options v1.ListOptions) (runtime.Object, error) {
 				return slm.kubeClient.Core().Pods(api.NamespaceAll).List(options)
@@ -164,6 +178,7 @@ func newendpointLookupController(kubeconfig *string) *serviceLookupController {
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: slm.enqueuePod,
 		},
+		cache.Indexers{},
 	)
 
 	slm.endpointsStore, slm.endpointController = cache.NewInformer(
@@ -179,9 +194,9 @@ func newendpointLookupController(kubeconfig *string) *serviceLookupController {
 		// resync is not needed
 		0,
 		cache.ResourceEventHandlerFuncs{
-			AddFunc:    slm.enqueueendpoint,
-			UpdateFunc: slm.enqueueendpoint,
-			DeleteFunc: slm.enqueueendpoint,
+			AddFunc:    slm.enqueueEndpoint,
+			UpdateFunc: slm.updateEndpoint,
+			DeleteFunc: slm.enqueueEndpoint,
 		},
 	)
 	return slm
