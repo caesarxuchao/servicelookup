@@ -22,14 +22,14 @@ type addressToPod struct {
 }
 
 func (a *addressToPod) Read(address string) (*v1.Pod, bool) {
-	lock.RLock()
-	defer lock.RUnlock()
-	pod, ok := a[address]
+	a.lock.RLock()
+	defer a.lock.RUnlock()
+	pod, ok := a.core[address]
 	return pod, ok
 }
 
 func (a *addressToPod) Write(address string, pod *v1.Pod) {
-	lock.Lock()
-	defer lock.Unlock()
-	a[address] = pod
+	a.lock.Lock()
+	defer a.lock.Unlock()
+	a.core[address] = pod
 }

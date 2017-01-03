@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"flag"
 	"fmt"
 	"os"
@@ -11,6 +10,7 @@ import (
 	"k8s.io/client-go/pkg/api"
 	"k8s.io/client-go/pkg/api/v1"
 	"k8s.io/client-go/pkg/runtime"
+	utilruntime "k8s.io/client-go/pkg/util/runtime"
 	"k8s.io/client-go/pkg/util/wait"
 	"k8s.io/client-go/pkg/util/workqueue"
 	"k8s.io/client-go/pkg/watch"
@@ -22,9 +22,9 @@ import (
 	//_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 )
 
-func getClientsetOrDie(kubeconfig string) *kuberntes.Clientset {
+func getClientsetOrDie(kubeconfig *string) *kubernetes.Clientset {
 	// Create the client config. Use kubeconfig if given, otherwise assume in-cluster.
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
 	if err != nil {
 		panic(err)
 	}
@@ -33,6 +33,7 @@ func getClientsetOrDie(kubeconfig string) *kuberntes.Clientset {
 	if err != nil {
 		panic(err)
 	}
+	return clientset
 }
 
 func main() {
@@ -42,15 +43,15 @@ func main() {
 }
 
 type serviceLookupController struct {
-	clientset *kubernetes.Clientset
+	kubeClient *kubernetes.Clientset
 	// A cache of endpoints
-	endpointsStore cache.StoreToendpointLister
+	endpointsStore cache.Store
 	// Watches changes to all endpoints
 	endpointController *cache.Controller
 	// A cache of pods
 	podStore cache.StoreToPodLister
 	// Watches changes to all pods
-	podController cache.Controller
+	podController *cache.Controller
 
 	addressToPod   addressToPod
 	podsQueue      workqueue.RateLimitingInterface
@@ -74,7 +75,7 @@ func (slm *serviceLookupController) podWorker() {
 		}
 		defer slm.podsQueue.Done(key)
 
-		obj, exists, err := slm.podStore.Indexer.GetByKey(key)
+		obj, exists, err := slm.podStore.Indexer.GetByKey(key.(string))
 		if !exists {
 			fmt.Printf("Pod has been deleted %v", key)
 			return false
@@ -109,28 +110,28 @@ func (slm *serviceLookupController) endpointWorker() {
 		}
 		defer slm.endpointsQueue.Done(key)
 
-		obj, exists, err := slm.endpointsStore.Indexer.GetByKey(key)
+		obj, exists, err := slm.endpointsStore.GetByKey(key.(string))
 		if !exists {
 			fmt.Printf("endpoint has been deleted %v", key)
 			return false
 		}
 
-		endpoints := obj.(*v1.endpoints)
+		endpoints := obj.(*v1.Endpoints)
 
+		var output string
 		for _, subset := range endpoints.Subsets {
-			for _, address := range subset.EndpointAddress {
+			for _, address := range subset.Addresses {
 				// TODO: need a lock here
-				pod, ok := slm.addressToPod.Read(address)
+				pod, ok := slm.addressToPod.Read(address.IP)
 				if !ok {
 					slm.endpointsQueue.AddRateLimited(key)
 					return false
 				}
-				output := bytes.NewBuffer()
-				fmt.FPrintf(output, "Pod [%s:%s] is backing service %s", pod.ObjectMeta.Name, address, endpoints.ObjectMeta.Name)
+				output += fmt.Sprintf("Pod [%s:%s] is backing service %s\n", pod.ObjectMeta.Name, address, endpoints.ObjectMeta.Name)
 			}
 		}
 
-		fmt.FPrintf(os.Stderr, output.String())
+		fmt.Fprintf(os.Stderr, output)
 		return false
 	}
 	for {
@@ -141,14 +142,14 @@ func (slm *serviceLookupController) endpointWorker() {
 	}
 }
 
-func newendpointLookupController(kubeconfig) *serviceLookupController {
+func newendpointLookupController(kubeconfig *string) *serviceLookupController {
 	slm := &serviceLookupController{
 		kubeClient:     getClientsetOrDie(kubeconfig),
 		podsQueue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "pods"),
 		endpointsQueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "endpoints"),
 	}
 
-	slm.podStore.Indexer, slm.podController = cache.NewIndexerInformer(
+	slm.podStore.Indexer, slm.podController = cache.NewInformer(
 		&cache.ListWatch{
 			ListFunc: func(options v1.ListOptions) (runtime.Object, error) {
 				return slm.kubeClient.Core().Pods(api.NamespaceAll).List(options)
@@ -165,16 +166,16 @@ func newendpointLookupController(kubeconfig) *serviceLookupController {
 		},
 	)
 
-	slm.endpointsStore.Indexer, slm.endpointController = cache.NewIndexerInformer(
+	slm.endpointsStore, slm.endpointController = cache.NewInformer(
 		&cache.ListWatch{
 			ListFunc: func(options v1.ListOptions) (runtime.Object, error) {
 				return slm.kubeClient.Core().Endpoints(api.NamespaceAll).List(options)
 			},
-			WatchFunc: func(options api.ListOptions) (watch.Interface, error) {
+			WatchFunc: func(options v1.ListOptions) (watch.Interface, error) {
 				return slm.kubeClient.Core().Endpoints(api.NamespaceAll).Watch(options)
 			},
 		},
-		&v1.endpoints{},
+		&v1.Endpoints{},
 		// resync is not needed
 		0,
 		cache.ResourceEventHandlerFuncs{
@@ -183,6 +184,7 @@ func newendpointLookupController(kubeconfig) *serviceLookupController {
 			DeleteFunc: slm.enqueueendpoint,
 		},
 	)
+	return slm
 }
 
 // Run begins watching and syncing.
