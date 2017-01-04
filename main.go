@@ -4,11 +4,15 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"reflect"
 	"time"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/pkg/api"
+	"k8s.io/client-go/pkg/api/errors"
 	"k8s.io/client-go/pkg/api/v1"
+	"k8s.io/client-go/pkg/apis/extensions/v1beta1"
+	metav1 "k8s.io/client-go/pkg/apis/meta/v1"
 	"k8s.io/client-go/pkg/runtime"
 	utilruntime "k8s.io/client-go/pkg/util/runtime"
 	"k8s.io/client-go/pkg/util/wait"
@@ -16,15 +20,14 @@ import (
 	"k8s.io/client-go/pkg/watch"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/kubernetes/pkg/controller"
 
 	// Only required to authenticate against GKE clusters
 	//_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 )
 
-func getClientsetOrDie(kubeconfig *string) *kubernetes.Clientset {
+func getClientsetOrDie(kubeconfig string) *kubernetes.Clientset {
 	// Create the client config. Use kubeconfig if given, otherwise assume in-cluster.
-	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		panic(err)
 	}
@@ -39,13 +42,14 @@ func getClientsetOrDie(kubeconfig *string) *kubernetes.Clientset {
 func main() {
 	kubeconfig := flag.String("kubeconfig", "", "Path to a kube config. Only required if out-of-cluster.")
 	flag.Parse()
-	controller := newServiceLookupController(kubeconfig)
+	controller := newServiceLookupController(*kubeconfig)
 	var stopCh <-chan struct{}
 	controller.Run(2, stopCh)
 }
 
 type serviceLookupController struct {
 	kubeClient *kubernetes.Clientset
+	tprClient  *podToServiceClient
 	// A cache of endpoints
 	endpointsStore cache.Store
 	// Watches changes to all endpoints
@@ -55,13 +59,13 @@ type serviceLookupController struct {
 	// Watches changes to all pods
 	podController *cache.Controller
 
-	addressToPod   addressToPod
+	addressToPod   *addressToPod
 	podsQueue      workqueue.RateLimitingInterface
 	endpointsQueue workqueue.RateLimitingInterface
 }
 
 func (slm *serviceLookupController) enqueuePod(obj interface{}) {
-	key, err := controller.KeyFunc(obj)
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
 		fmt.Printf("Couldn't get key for object %+v: %v", obj, err)
 		return
@@ -79,11 +83,11 @@ func (slm *serviceLookupController) podWorker() {
 
 		obj, exists, err := slm.podStore.Indexer.GetByKey(key.(string))
 		if !exists {
-			fmt.Printf("Pod has been deleted %v", key)
+			fmt.Printf("Pod has been deleted %v\n", key)
 			return false
 		}
 		if err != nil {
-			fmt.Printf("cannot get pod: %v", key)
+			fmt.Printf("cannot get pod: %v\n", key)
 			return false
 		}
 
@@ -100,7 +104,7 @@ func (slm *serviceLookupController) podWorker() {
 }
 
 func (slm *serviceLookupController) enqueueEndpoint(obj interface{}) {
-	key, err := controller.KeyFunc(obj)
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
 		fmt.Printf("Couldn't get key for object %+v: %v", obj, err)
 		return
@@ -109,6 +113,11 @@ func (slm *serviceLookupController) enqueueEndpoint(obj interface{}) {
 }
 
 func (slm *serviceLookupController) updateEndpoint(oldObj interface{}, newObj interface{}) {
+	oldEndpoints := oldObj.(*v1.Endpoints)
+	newEndpoints := newObj.(*v1.Endpoints)
+	if reflect.DeepEqual(oldEndpoints.Subsets, newEndpoints.Subsets) {
+		return
+	}
 	slm.enqueueEndpoint(newObj)
 }
 
@@ -132,20 +141,33 @@ func (slm *serviceLookupController) endpointWorker() {
 
 		endpoints := obj.(*v1.Endpoints)
 
-		var output string
+		var podToServiceList []PodToService
 		for _, subset := range endpoints.Subsets {
 			for _, address := range subset.Addresses {
-				// TODO: need a lock here
 				pod, ok := slm.addressToPod.Read(address.IP)
 				if !ok {
 					slm.endpointsQueue.AddRateLimited(key)
 					return false
 				}
-				output += fmt.Sprintf("Pod [%s:%s] is backing service %s\n", pod.ObjectMeta.Name, address, endpoints.ObjectMeta.Name)
+				podToServiceList = append(podToServiceList, PodToService{
+					Metadata: v1.ObjectMeta{
+						Name: pod.ObjectMeta.Name,
+					},
+					PodName:     pod.ObjectMeta.Name,
+					PodAddress:  address.IP,
+					PodUID:      pod.ObjectMeta.UID,
+					ServiceName: endpoints.ObjectMeta.Name,
+				})
 			}
 		}
 
-		fmt.Fprintf(os.Stderr, output)
+		for _, podToService := range podToServiceList {
+			_, err := slm.tprClient.Update(&podToService)
+			if err != nil {
+				fmt.Printf("update tpr error: %v\n", err)
+			}
+			fmt.Fprintf(os.Stderr, podToService.String())
+		}
 		return false
 	}
 	for {
@@ -156,12 +178,15 @@ func (slm *serviceLookupController) endpointWorker() {
 	}
 }
 
-func newServiceLookupController(kubeconfig *string) *serviceLookupController {
+func newServiceLookupController(kubeconfig string) *serviceLookupController {
 	slm := &serviceLookupController{
-		kubeClient:     getClientsetOrDie(kubeconfig),
-		podsQueue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "pods"),
-		endpointsQueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "endpoints"),
+		kubeClient: getClientsetOrDie(kubeconfig),
+		tprClient:  getTPRClientOrDie(kubeconfig),
+		podsQueue:  workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "pods"),
+		endpointsQueue: workqueue.NewNamedRateLimitingQueue(
+			workqueue.NewMaxOfRateLimiter(workqueue.NewItemExponentialFailureRateLimiter(100*time.Millisecond, 5*time.Second)), "endpoints"),
 	}
+	slm.addressToPod = newAddressToPod()
 
 	slm.podStore.Indexer, slm.podController = cache.NewIndexerInformer(
 		&cache.ListWatch{
@@ -206,6 +231,7 @@ func newServiceLookupController(kubeconfig *string) *serviceLookupController {
 func (slm *serviceLookupController) Run(workers int, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	fmt.Println("Starting serviceLookupController Manager")
+	slm.registerTPR()
 	go slm.podController.Run(stopCh)
 	go slm.endpointController.Run(stopCh)
 	// wait for the controller to List. This help avoid churns during start up.
@@ -221,4 +247,32 @@ func (slm *serviceLookupController) Run(workers int, stopCh <-chan struct{}) {
 	fmt.Printf("Shutting down Service Lookup Controller")
 	slm.podsQueue.ShutDown()
 	slm.endpointsQueue.ShutDown()
+}
+
+func (slm *serviceLookupController) registerTPR() {
+	// initialize third party resource if it does not exist
+	tpr, err := slm.kubeClient.Extensions().ThirdPartyResources().Get("pod-to-service.k8s.io", metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			tpr := &v1beta1.ThirdPartyResource{
+				ObjectMeta: v1.ObjectMeta{
+					Name: "pod-to-service.k8s.io",
+				},
+				Versions: []v1beta1.APIVersion{
+					{Name: "v1"},
+				},
+				Description: "search service by the name of the backup pod",
+			}
+
+			_, err := slm.kubeClient.Extensions().ThirdPartyResources().Create(tpr)
+			if err != nil {
+				panic(err)
+			}
+			fmt.Printf("TPR created\n")
+		} else {
+			panic(err)
+		}
+	} else {
+		fmt.Printf("TPR already exists %#v\n", tpr)
+	}
 }
