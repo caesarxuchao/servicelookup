@@ -162,9 +162,23 @@ func (slm *serviceLookupController) endpointWorker() {
 		}
 
 		for _, podToService := range podToServiceList {
-			_, err := slm.tprClient.Update(&podToService)
+			current, err := slm.tprClient.Get(podToService.Metadata.Name)
+			if err != nil {
+				if !errors.IsNotFound(err) {
+					fmt.Printf("get tpr error: %v\n", err)
+					return false
+				}
+				_, err2 := slm.tprClient.Create(&podToService)
+				if err2 != nil {
+					fmt.Printf("create tpr error: %v\n", err2)
+					return false
+				}
+			}
+			podToService.Metadata = current.Metadata
+			_, err = slm.tprClient.Update(&podToService)
 			if err != nil {
 				fmt.Printf("update tpr error: %v\n", err)
+				return false
 			}
 			fmt.Fprintf(os.Stderr, podToService.String())
 		}
@@ -251,12 +265,12 @@ func (slm *serviceLookupController) Run(workers int, stopCh <-chan struct{}) {
 
 func (slm *serviceLookupController) registerTPR() {
 	// initialize third party resource if it does not exist
-	tpr, err := slm.kubeClient.Extensions().ThirdPartyResources().Get("pod-to-service.k8s.io", metav1.GetOptions{})
+	tpr, err := slm.kubeClient.Extensions().ThirdPartyResources().Get("pod-to-service.caesarxuchao.io", metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
 			tpr := &v1beta1.ThirdPartyResource{
 				ObjectMeta: v1.ObjectMeta{
-					Name: "pod-to-service.k8s.io",
+					Name: "pod-to-service.caesarxuchao.io",
 				},
 				Versions: []v1beta1.APIVersion{
 					{Name: "v1"},

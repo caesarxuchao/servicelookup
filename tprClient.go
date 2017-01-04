@@ -17,7 +17,7 @@ type podToServiceClient struct {
 func (c *podToServiceClient) Create(body *PodToService) (*PodToService, error) {
 	var ret PodToService
 	err := c.rest.Post().
-		Resource("PodToService").
+		Resource("podtoservices").
 		Namespace(api.NamespaceDefault).
 		Body(body).
 		Do().Into(&ret)
@@ -27,8 +27,9 @@ func (c *podToServiceClient) Create(body *PodToService) (*PodToService, error) {
 func (c *podToServiceClient) Update(body *PodToService) (*PodToService, error) {
 	var ret PodToService
 	err := c.rest.Put().
-		Resource("PodToService").
+		Resource("podtoservices").
 		Namespace(api.NamespaceDefault).
+		Name(body.Metadata.Name).
 		Body(body).
 		Do().Into(&ret)
 	return &ret, err
@@ -37,7 +38,7 @@ func (c *podToServiceClient) Update(body *PodToService) (*PodToService, error) {
 func (c *podToServiceClient) Get(name string) (*PodToService, error) {
 	var ret PodToService
 	err := c.rest.Get().
-		Resource("PodToService").
+		Resource("podtoservices").
 		Namespace(api.NamespaceDefault).
 		Name(name).
 		Do().Into(&ret)
@@ -46,7 +47,7 @@ func (c *podToServiceClient) Get(name string) (*PodToService, error) {
 
 func configureClient(config *rest.Config) {
 	groupversion := schema.GroupVersion{
-		Group:   "k8s.io",
+		Group:   "caesarxuchao.io",
 		Version: "v1",
 	}
 
@@ -75,6 +76,7 @@ func getTPRClientOrDie(kubeconfig string) *podToServiceClient {
 	if err != nil {
 		panic(err)
 	}
+	configureClient(config)
 	rest, err := rest.RESTClientFor(config)
 	if err != nil {
 		panic(err)
