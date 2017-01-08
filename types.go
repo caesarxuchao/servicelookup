@@ -17,11 +17,11 @@ import (
 type PodToService struct {
 	metav1.TypeMeta `json:",inline"`
 	Metadata        v1.ObjectMeta `json:"metadata"`
-	PodName         string        `json:"podName"`
-	PodAddress      string        `json:"podAddress"`
-	PodUID          types.UID     `json:"podUID"`
-	ServiceName     string        `json:"serviceName,omitempty"`
-	// ServiceAddress string `json:"serviceAddress,omitempty"`
+
+	PodName     string    `json:"podName"`
+	PodAddress  string    `json:"podAddress"`
+	PodUID      types.UID `json:"podUID"`
+	ServiceName string    `json:"serviceName,omitempty"`
 }
 
 func (p PodToService) String() string {

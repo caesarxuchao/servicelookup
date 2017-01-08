@@ -73,6 +73,16 @@ func (slm *serviceLookupController) enqueuePod(obj interface{}) {
 	slm.podsQueue.Add(key)
 }
 
+func (slm *serviceLookupController) updatePod(oldObj, newObj interface{}) {
+	oldPod := oldObj.(*v1.Pod)
+	newPod := newObj.(*v1.Pod)
+
+	if newPod.Status.PodIP == oldPod.Status.PodIP {
+		return
+	}
+	slm.enqueuePod(newObj)
+}
+
 func (slm *serviceLookupController) podWorker() {
 	workFunc := func() bool {
 		key, quit := slm.podsQueue.Get()
@@ -92,6 +102,7 @@ func (slm *serviceLookupController) podWorker() {
 		}
 
 		pod := obj.(*v1.Pod)
+		// fmt.Printf("CHAO: podWorker process IP: %s\n", pod.Status.PodIP)
 		slm.addressToPod.Write(pod.Status.PodIP, pod)
 		return false
 	}
@@ -131,21 +142,27 @@ func (slm *serviceLookupController) endpointWorker() {
 
 		obj, exists, err := slm.endpointsStore.GetByKey(key.(string))
 		if !exists {
-			fmt.Printf("endpoint has been deleted %v", key)
+			fmt.Printf("endpoint has been deleted %v\n", key)
 			return false
 		}
 		if err != nil {
-			fmt.Printf("cannot get endpoint: %v", key)
+			fmt.Printf("cannot get endpoint: %v\n", key)
 			return false
 		}
 
 		endpoints := obj.(*v1.Endpoints)
+
+		// there is no pod backing service "kubernetes"
+		if endpoints.ObjectMeta.Name == "kubernetes" {
+			return false
+		}
 
 		var podToServiceList []PodToService
 		for _, subset := range endpoints.Subsets {
 			for _, address := range subset.Addresses {
 				pod, ok := slm.addressToPod.Read(address.IP)
 				if !ok {
+					fmt.Printf("addressToPod can't find %s\n", address.IP)
 					slm.endpointsQueue.AddRateLimited(key)
 					return false
 				}
@@ -173,12 +190,14 @@ func (slm *serviceLookupController) endpointWorker() {
 					fmt.Printf("create tpr error: %v\n", err2)
 					return false
 				}
-			}
-			podToService.Metadata = current.Metadata
-			_, err = slm.tprClient.Update(&podToService)
-			if err != nil {
-				fmt.Printf("update tpr error: %v\n", err)
-				return false
+			} else {
+				podToService.Metadata = current.Metadata
+				_, err = slm.tprClient.Update(&podToService)
+				if err != nil {
+					fmt.Printf("update tpr error: %v\n", err)
+					fmt.Println("CHAO: podToService.Metadata.Name=", podToService.Metadata.Name)
+					return false
+				}
 			}
 			fmt.Fprintf(os.Stderr, podToService.String())
 		}
@@ -215,7 +234,8 @@ func newServiceLookupController(kubeconfig string) *serviceLookupController {
 		// resync is not needed
 		0,
 		cache.ResourceEventHandlerFuncs{
-			AddFunc: slm.enqueuePod,
+			AddFunc:    slm.enqueuePod,
+			UpdateFunc: slm.updatePod,
 		},
 		cache.Indexers{},
 	)
